@@ -1,56 +1,130 @@
 # Setup and Validation Guide
 
-# Create kind cluster
+> **Assumptions**
+>
+> - Namespace: `todoapp`
+> - Deployment: `todoapp` (containerPort `8080`)
+> - Service: `todo-svc` (port `80` → targetPort `8080`)
+> - Ingress: `todo-web` (class `nginx`, host `localhost`)
+> - kind cluster config at `./.infrastructure/cluster.yml`
+> - `bootstrap.sh` deploys only app resources (Namespace/ConfigMap/Secret/PVC/Deployment/Service/Ingress) — it **does not** install ingress-nginx controller (we do it here).
 
-```
+---
+
+## 1) Create kind cluster
+
+```bash
+set -euo pipefail
+
+# Create cluster with the intended config
 kind create cluster --config ./.infrastructure/cluster.yml
-kubectl get nodes # wait until all nodes are Ready
+
+# Wait for nodes to be Ready (explicit)
+kubectl wait --for=condition=Ready --timeout=180s node --all
+
+# Show nodes
+kubectl get nodes -o wide
 ```
 
-# Install ingress-nginx controller
+# Install controller (official manifest for kind)
 
 ```
 kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
-kubectl -n ingress-nginx get pods # wait until controller pods are Ready
 ```
 
-# Deploy the app
+# Wait until controller pods are Ready
+
+```
+kubectl -n ingress-nginx wait --for=condition=Ready pod -l app.kubernetes.io/name=ingress-nginx --timeout=300s
+```
+
+# Confirm controller is up
+
+```
+kubectl -n ingress-nginx get deploy,po,svc -o wide
+```
+
+# Apply your app stack (should create NS `todoapp` and all resources)
 
 ```
 ./bootstrap.sh
-kubectl -n todo get deploy,svc # wait until all todo namespace resources are Ready
 ```
 
-# Validate ingress created and bound
+# Work in the target namespace by default
 
 ```
-kubectl -n todo get ingress todo-web -o wide
-kubectl -n todo get ingress todo-web -o yaml | grep -E "host:|path:|use-regex|rewrite-target"
+kubectl config set-context --current --namespace=todoapp
 ```
 
-# Access from host
+# Wait for Deployment rollout
+
+```
+kubectl rollout status deploy/todoapp --timeout=300s
+```
+
+# Inspect core resources
+
+```
+kubectl get deploy,po,svc,ingress,endpoints -o wide
+```
+
+# Check Ingress object and key annotations/paths
+
+```
+kubectl get ingress todo-web -o wide
+kubectl get ingress todo-web -o yaml | grep -E "ingressClassName:|host:|path:|use-regex|rewrite-target"
+```
+
+# Confirm Service has Endpoints (i.e., selector matches Pods and Pods are Ready)
+
+```
+kubectl get endpoints todo-svc -o wide
+```
+
+# Basic reachability
 
 ```
 curl -I http://localhost
 curl -sSf http://localhost/ | head -n 5
 ```
 
-## Check no 404s
-
-## Open http://localhost in a browser → DevTools → Network → verify no 404.
-
-# Additionally test key paths:
+# No 404s on key paths
 
 ```
-for p in / /static/ /api/health; do curl -s -o /dev/null -w "%{http_code} $p\n" http://localhost$p; done
+for p in / /static/ /api/health; do
+  code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost$p")
+  printf "%3s  %s\n" "$code" "$p"
+done
 ```
 
-## responses should be 200 or 30x (but not 404)
+# Responses should be 200 or 30x (but not 404)
 
-# Diagnostics in case of problems
+# 1) Ingress+controller
 
 ```
-kubectl -n todo describe ingress todo-web
+kubectl describe ingress todo-web
 kubectl -n ingress-nginx logs deploy/ingress-nginx-controller --tail=200
-kubectl -n todo get endpoints todo-svc -o yaml
+```
+
+# 2) Service and Endpoints
+
+```
+kubectl get svc todo-svc -o yaml
+kubectl get endpoints todo-svc -o yaml
+```
+
+# 3) Pod readiness
+
+```
+kubectl get po -o wide --show-labels
+kubectl describe po -l app=todoapp
+kubectl logs deploy/todoapp --tail=200
+```
+
+# 4) Direct app check (bypass Ingress)
+
+```
+kubectl port-forward deploy/todoapp 8080:8080 &
+sleep 2
+curl -I http://127.0.0.1:8080/
 ```
